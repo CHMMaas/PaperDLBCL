@@ -1,0 +1,789 @@
+---
+title: "Treatment effect of 6xRCHOP21+2R versus 6xRCHOP21 of patients with DLBCL diagnosed between 2014 and 2018"
+author: "Carolien C.H.M. Maas"
+date: "21 December 2022"
+output: word_document
+---
+
+# Load packages
+```{r, include=FALSE}
+# remove previous history
+rm(list = ls(all.names=TRUE))
+
+# Load packages
+library(haven)       # import STATA file
+library(mice)        # imputation
+library(Hmisc)       # describe
+library(survival)    # Kaplan-Meier curve
+library(survminer)   # plot Kaplan-Meier
+library(openxlsx)    # write to Excel
+library(ggplot2)     # plots
+library(survRM2)     # restricted mean survival time analysis https://cran.r-project.org/web/packages/survRM2/vignettes/survRM2-vignette3-2.html
+library(RISCA)       # ipw.log.rank
+library(ggpubr)      # plots patient characteristics
+library(grf)         # survival forest https://grf-labs.github.io/grf/reference/causal_survival_forest.html
+library(remotes)
+# remotes::install_github("CHMMaas/ValidationMetrics")
+# library(ValidationMetrics) # calibration plots
+# remotes::install_github("CHMMaas/HTEPredictionMetrics")
+# library(HTEPredictionMetrics) # metrics for CATE
+set.seed(100)
+file.path <- "G:/IKNL/Registratie en Onderzoek/Onderzoek/projecten lopend/hematologie/DLBCL/Effectiveness/Carolien/Code/DLBCL/"
+```
+
+# Load data
+```{r, include=FALSE}
+DLBCL.raw <- haven::read_dta(paste0(file.path, "Data/analyses_1212.dta"))
+```
+
+##### Exclusion of patients
+In total, 18 patients that were treated with 6xRCHOP21 were excluded, because had an event within 42 days, i.e. before additional rituximab could be administered.
+Three patients were excluded, because they didn"t have an end date for therapy.
+```{r}
+DLBCL.raw <- DLBCL.raw[!is.na(DLBCL.raw$txstop_rchop21),]
+```
+```{r, echo=FALSE, comment=NA}
+cat("In total,", nrow(DLBCL.raw), "patients are included.")
+```
+
+##### Recode
+```{r}
+DLBCL.raw$geslacht <- DLBCL.raw$geslacht-1
+```
+If `center` is missing, it is not an academic center.
+```{r}
+DLBCL.raw$center[is.na(DLBCL.raw$center)] <- 0
+```
+Define recurrence time as the difference in time in years between the end date of the treatment of 6xRCHOP21 (txstop_rchop21) and the date of event-free survival (efsdat).
+```{r}
+DLBCL.raw$Rec.time <- as.numeric(difftime(DLBCL.raw$efsdat, DLBCL.raw$txstop_rchop21, unit="weeks"))/52
+```
+Define survival time as the difference in time in years between the end date of the treatment of 6xRCHOP21 (txstop_rchop21) and the date of death or date to follow-up.
+```{r}
+DLBCL.raw$Surv.time <- as.numeric(difftime(DLBCL.raw$osdat, DLBCL.raw$txstop_rchop21, unit="weeks"))/52
+```
+Make all variables numeric.
+```{r, warning=FALSE}
+DLBCL.raw <- as.data.frame(lapply(DLBCL.raw, as.numeric, na.rm=FALSE))
+```
+Ensure categorical variables are considered as factors, such that dummies are created for each level in regression.
+```{r}
+DLBCL.raw$sescat <- as.factor(DLBCL.raw$sescat)
+DLBCL.raw$stadium <- as.factor(DLBCL.raw$stadium)
+DLBCL.raw$region <- as.factor(DLBCL.raw$region)
+```
+### Describe data
+```{r}
+to.be.imputed.DLBCL <- DLBCL.raw[, c("RCHOP21", "geslacht", "lft", "stadium",
+    "ipi_ldh", "ipi_extra", "ipi_total", "ipi_ps", "region", 
+    "sescat", "malignancy", "center", "efsi", "Rec.time", "dood", "Surv.time",
+    "jaar")]
+```
+```{r, include=FALSE}
+save(to.be.imputed.DLBCL, file=paste0(file.path, "Data/DLBCL.Rdata"), compress=TRUE)
+```
+### Impute missing data with single imputation
+```{r}
+# exclude "jaar" before multiple imputation
+# to.be.imputed.DLBCL <- to.be.imputed.DLBCL[,-ncol(to.be.imputed.DLBCL)]
+
+DLBCL <- mice::complete(mice::mice(to.be.imputed.DLBCL, m=1, print=FALSE))
+```
+Save the distributions of all variables, which is necessary for Harrell summaries.
+```{r}
+dd <- rms::datadist(DLBCL)
+options(datadist="dd")
+```
+##### Define IPI score
+If performance score, elevated LDH, or >1 extranodal site is missing, set to 0.
+```{r}
+DLBCL$ipi_ps_na <- DLBCL$ipi_ps
+DLBCL$ipi_ps_na[is.na(DLBCL.raw$ipi_ps)] <- 0
+DLBCL$ipi_ldh_na <- DLBCL$ipi_ldh
+DLBCL$ipi_ldh_na[is.na(DLBCL.raw$ipi_ldh)] <- 0
+DLBCL$ipi_extra_na <- DLBCL$ipi_extra
+DLBCL$ipi_extra_na[is.na(DLBCL.raw$ipi_extra)] <- 0
+table(DLBCL$ipi_total)
+```
+Define some variables binary instead of categorical
+```{r, eval=TRUE}
+DLBCL$stage2 <- as.numeric(DLBCL$stadium==2)
+DLBCL$stage3 <- as.numeric(DLBCL$stadium==3)
+DLBCL$stage4 <- as.numeric(DLBCL$stadium==4)
+for (regio in 1:9){
+  DLBCL[, paste0("region", regio)] <- as.numeric(DLBCL$region==regio)
+}
+DLBCL$ses.low <- as.numeric(DLBCL$sescat==0)
+DLBCL$ses.medium <- as.numeric(DLBCL$sescat==1)
+DLBCL$ses.high <- as.numeric(DLBCL$sescat==2)
+save(DLBCL, file=paste0(file.path, "Data/imputed.DLBCL.Rdata"), compress=TRUE)
+```
+\newpage
+# Propensity score model
+1. RCHOP21 indicates whether the patient received 6xRCHOP21 or 6xRCHOP21+2R.
+2. region indicates the region where the patient is treated.
+3. The International Prognostic Index (IPI) consists of 
+  + an indicator of age > 60 (lft)
+  + stage 3 or 4 (stadium)
+  + WHO score ECOG/Zubrod status 2, 3, or 4 (ipi_ps)
+  + elevated serum LDH (ipi_ldh)
+  + more than 1 extranodal site (ipi_extra).
+  + Note 1: we don"t use the ipi_total variable, because it underestimates the risk due to missing values, so we add each factor seperately as covariates. 
+  + Note 2: since ipi_ps has so many missing values that are imputed, we exclude it from the models.
+4. malignancy indicates if a patient had one or more previous malignancy
+5. center indicates if the center that the patient is treated in was academic or not
+6. ses indicates Social Economic Status, which is a proxy for comorbidity, and is divided into low, medium, and high.
+```{r}
+# fixed effects propensity score model
+PS.formula.FE <- RCHOP21~geslacht+lft+stadium+ipi_ps_na+ipi_ldh_na+ipi_extra_na+malignancy+region+center+ses.low+ses.high
+PS.model <- stats::glm(PS.formula.FE, family="binomial", data=DLBCL)
+# summary(PS.model)
+```
+The propensity score ($e_i$), i.e. the predicted probability of treatment.
+```{r}
+DLBCL$e.i <- predict(PS.model, type="response")
+```
+Assess the performance of the propensity score model.
+```{r}
+rms::val.prob(DLBCL$e.i, DLBCL$RCHOP21, g=10)
+png(file=paste0(file.path, "Results/PS.model.performance.png"), width=500, height=500, res=100)
+rms::val.prob(DLBCL$e.i, DLBCL$RCHOP21, g=10)
+grDevices::dev.off()
+```
+```{r, include=FALSE, echo=FALSE, message=FALSE}
+knitr::include_graphics(paste0(file.path, "Results/PS.model.performance.png"))
+```
+# Write Propensity Score Model Table to Excel
+```{r, include=FALSE}
+names <- c("Intercept",
+           "Females",
+           "IPI-score",
+           "   Age",
+           "   Stage",
+           "      II",
+           "      III",
+           "      IV",
+           "   Performance status",
+           "   Elevated serum LDH",
+           "   > 1 extranodal site",
+           "> 1 previous malignancy",
+           "Regions",
+           "   Region 1",
+           "   Region 2",
+           "   Region 3",
+           "   Region 4",
+           "   Region 5",
+           "   Region 6",
+           "   Region 7",
+           "   Region 8",
+           "   Region 9",
+           "Academic center",
+           "Social Economic Status (SES)",
+           "   Low SES",
+           "   Medium SES",
+           "   High SES")
+CI <- exp(confint(PS.model))
+values <- data.frame(coefficients=sprintf("%.2f", exp(coef(PS.model))),
+                     CI=paste0("[", sprintf("%.2f", CI[,"2.5 %"]), "; ", sprintf("%.2f", CI[,"97.5 %"]), "]"))
+values.table <- rbind(values[1:2,],
+                  "",             # IPI-score
+                  values[3,],
+                  "",             # Stage
+                  c("(ref)", ""), # stage1
+                  values[4:9,],
+                  "",             # Region
+                  c("(ref)", ""), # region1
+                  values[10:18,],
+                  "",             # SES
+                  values[19,],
+                  c("(ref)", ""),
+                  values[20,])
+write.xlsx(data.frame(names=names, 
+                           OR=values.table[, "coefficients"],
+                           CI=values.table[, "CI"]),
+           file=paste0(file.path, "Results/PS.model.xlsx"))
+```
+##### Overlap assumption is satisfied
+```{r}
+overlap.assumption.plot <- ggplot2::ggplot(DLBCL, ggplot2::aes(x=e.i, fill=as.factor(RCHOP21)))+
+  ggplot2::geom_histogram(color="#e9ecef", alpha=0.6, binwidth=0.02)+
+  ggplot2::theme_light()+
+  ggplot2::theme(legend.title=ggplot2::element_blank(), text=ggplot2::element_text(size=12))+
+  ggplot2::scale_fill_discrete(labels=c("6xRCHOP21", "6xRCHOP21+2R"))+
+  ggplot2::ylab("Frequency")+
+  ggplot2::xlab("Propensity score")
+show(overlap.assumption.plot)
+png(file=paste0(file.path, "Results/Rec.hist.PS.png"), width=700, height=500)
+show(overlap.assumption.plot)
+grDevices::dev.off()
+```
+```{r, echo=FALSE}
+knitr::include_graphics(paste0(file.path, "Results/Rec.hist.PS.png"))
+```
+
+\newpage
+# Stabilized inverse propensity score weights
+```{r}
+P.Z <- mean(DLBCL$RCHOP21)
+DLBCL$stabilized.w.i <- P.Z*DLBCL$RCHOP21/DLBCL$e.i + 
+                        (1-P.Z)*(1-DLBCL$RCHOP21)/(1-DLBCL$e.i)
+```
+
+##### Check if the covariates are balanced between the treatment groups after weighting with stabilized inverse propensity scores.
+```{r, include=FALSE}
+# continuous variable: age
+# binary variables: geslacht, ipi_ldh, ipi_extra, malignancy, center
+bin.var.names <- c("geslacht", 
+                   "ipi_ldh_na", 
+                   "ipi_ps_na", 
+                   "ipi_extra_na", 
+                   "malignancy", 
+                   "center",
+                   "lft")
+bin.full.names <- c("Gender", 
+                    "Elevated serum LDH", 
+                    "Poor performance",
+                    "At least 1 extranodal site",
+                    "At least 1 previous malignancy",
+                    "Academic center",
+                    "Age")
+bin.df.names <- data.frame(bin.var.names=bin.var.names, bin.full.names=bin.full.names)
+binary.plotList <- lapply(
+  bin.var.names,
+  function(variable.name){
+    if (variable.name!="lft"){
+      single.plot <- ggplot2::ggplot(DLBCL, ggplot2::aes(fill=as.factor(eval(parse(text=variable.name))),
+                                            x=as.factor(RCHOP21), weight=stabilized.w.i))+
+                      ggplot2::geom_bar(position="fill")+
+                      ggplot2::geom_text(
+                        aes(label=signif(..count../tapply(..count.., ..x.., sum)[as.character(..x..)]*100, digits=3)),
+                        stat="count", size=10,
+                        position=position_fill(vjust=0.5))+
+                      ggplot2::theme(text=ggplot2::element_text(size=30))+
+                      ggplot2::theme(legend.position="none")+
+                      ggplot2::scale_x_discrete(labels=c("0"="6xRCHOP21", "1"="6xRCHOP21+2R"))+
+                      ggplot2::ylab(bin.df.names[bin.var.names==variable.name, "bin.full.names"])+
+                      ggplot2::scale_y_continuous(labels=scales::percent)+
+                      ggplot2::xlab("")
+    } else{
+      single.plot <- ggplot2::ggplot(DLBCL, ggplot2::aes(x=as.factor(RCHOP21), y=lft, weight=stabilized.w.i))+
+                    ggplot2::geom_boxplot()+
+                    ggplot2::theme(legend.title=ggplot2::element_blank(), text=ggplot2::element_text(size=30))+
+                    ggplot2::scale_x_discrete(labels=c("0"="6xRCHOP21", "1"="6xRCHOP21+2R"))+
+                    ggplot2::ylab("Age")+
+                    ggplot2::xlab("")
+    }
+    ggsave(filename=paste0(file.path, "Results/Plots/", variable.name, ".png"))
+    single.plot
+  }
+)
+png(file=paste0(file.path, "Results/Rec_cont_binary_variables.png"), width=1500, height=1000)
+ggarrange(plotlist=binary.plotList)
+grDevices::dev.off()
+```
+```{r, echo=FALSE}
+knitr::include_graphics(paste0(file.path, "Results/Rec_cont_binary_variables.png"))
+```
+```{r, include=FALSE}
+# categorical variables: region, stadium, ses
+cat.var.names <- c("region", "stadium", "sescat")
+cat.full.names <- c("Region", "Stage", "Social economic states")
+cat.df.names <- data.frame(cat.var.names=cat.var.names, cat.full.names=cat.full.names)
+categorical.plotList <- lapply(
+  cat.var.names,
+  function(variable.name){
+    single.plot <- ggplot2::ggplot(DLBCL, ggplot2::aes(fill=as.factor(eval(parse(text=variable.name))),
+                                                       x=as.factor(RCHOP21),
+                                                       weight=stabilized.w.i))+
+      ggplot2::geom_bar(aes( y=..count../tapply(..count.., ..x.. ,sum)[..x..]))+
+      facet_wrap(~as.factor(eval(parse(text=variable.name))))+
+      ggplot2::geom_text(
+        aes(label=signif(..count../tapply(..count.., ..x.., sum)[as.character(..x..)]*100, digits=3)),
+        stat="count", size=10,
+        position=position_fill(vjust=0.6))+
+      ggplot2::theme(legend.position="none")+
+      ggplot2::theme(text=ggplot2::element_text(size=30))+
+      ggplot2::scale_x_discrete(labels=c("0"="6xRCHOP21", "1"="6xRCHOP21+2R"))+
+      ggplot2::ylab(cat.df.names[cat.var.names==variable.name, "cat.full.names"])+
+      ggplot2::scale_y_continuous(labels=scales::percent)+
+      ggplot2::xlab("")
+    ggsave(filename=paste0(file.path, "Results/Plots/", variable.name, ".png"))
+    single.plot
+  }
+)
+png(file=paste0(file.path, "Results/Rec_categorical_variables.png"), width=1500, height=2000)
+ggarrange(plotlist=categorical.plotList, ncol=1)
+grDevices::dev.off()
+```
+```{r, echo=FALSE}
+knitr::include_graphics(paste0(file.path, "Results/Rec_categorical_variables.png"))
+```
+Check balance before and after weighting using standardized mean difference
+```{r, eval=TRUE}
+# covariates
+vars <- c(bin.var.names, paste0("region", 2:9), paste0("stage", 2:4), 
+                  "ses.low", "ses.medium", "ses.high")
+# construct a table
+tabUnmatched <- tableone::CreateTableOne(vars=vars, strata="RCHOP21", data=DLBCL, test=FALSE)
+# show table with SMD
+print(tabUnmatched, smd=TRUE)
+# 11 covariates with important imbalance
+stats::addmargins(table(tableone::ExtractSmd(tabUnmatched) > 0.1))
+
+# weighted data
+weighted.data <- survey::svydesign(ids = ~ 1, data=DLBCL[, c("RCHOP21", "stabilized.w.i", vars)], 
+                            weights = ~ stabilized.w.i)
+# construct a table
+tabWeighted <- tableone::svyCreateTableOne(vars = vars, strata = "RCHOP21", data = weighted.data, test = FALSE)
+# show table with SMD
+print(tabWeighted, smd = TRUE)
+# 0 covariates with important imbalance
+stats::addmargins(table(tableone::ExtractSmd(tabWeighted) > 0.1))
+
+png(file=paste0(file.path, "Results/PS.weighting.all.png"), 
+    width=16, height=16, units="cm", res=300)
+plot(x=tableone::ExtractSmd(tabUnmatched), y=tableone::ExtractSmd(tabWeighted), 
+     xlab="Before weighting", ylab="After weighting", main="All patients",
+     xlim=c(0, 1), ylim=c(0, 1), cex=2, cex.lab=1.5)
+abline(a=0, b=1, col="red")
+grDevices::dev.off()
+```
+```{r, echo=FALSE}
+knitr::include_graphics(paste0(file.path, "Results/PS.weighting.all.png"))
+```
+\newpage
+# Recurrence and overall survival
+### Set time-to-event
+The event-free survival indicator (efsi) is 1 if the patient has a recurrence or if there is no response to initial treatment and second line treatment is administered, and 0 otherwise. The time until the event is the event-free survival time.
+```{r}
+DLBCL$S.Rec <- survival::Surv(event=DLBCL$efsi, time=DLBCL$Rec.time)
+med.Rec.time <- stats::quantile(prodlim::prodlim(prodlim::Hist(Rec.time, efsi==1)~1, data=DLBCL, reverse=TRUE))$quantiles.survival
+paste0(sprintf("%.2f", med.Rec.time[3, "quantile"]), " [IQR: ",
+       sprintf("%.2f", med.Rec.time[4, "quantile"]), "-",
+       sprintf("%.2f", med.Rec.time[2, "quantile"]), "]")
+```
+Set the overall survival.
+```{r}
+DLBCL$S.Surv <- survival::Surv(event=DLBCL$dood, time=DLBCL$Surv.time)
+med.FU.time <- stats::quantile(prodlim::prodlim(prodlim::Hist(Surv.time, dood==1)~1, data=DLBCL, reverse=TRUE))$quantiles.survival
+paste0(sprintf("%.2f", med.FU.time[3, "quantile"]), " [IQR: ",
+       sprintf("%.2f", med.FU.time[4, "quantile"]), "-",
+       sprintf("%.2f", med.FU.time[2, "quantile"]), "]")
+```
+\newpage
+### For a specific limit.year and outcome, show:
+1. Kaplan-Meier curves
+2. If proportional hazard assumption is satisfied
+3. Kaplan-Meier estimates, hazard ratios and RMST stratified by IPI score
+4. Standardized mean difference before and after weighting with PS stratified by IPI score
+```{r}
+ylabs <- data.frame(outcome=c("Rec", "Surv"),
+                    label=c("Event-free survival", "Overall survival"))
+for (limit.year in c(5)){
+  for (outcome in c("Rec", "Surv")){
+    # Survival outcome
+    S <- eval(parse(text=paste0("DLBCL$S.", outcome)))
+    # Set the censoring of patients with follow-up time more than x years to "censored"
+    S[S[,1]>limit.year, 2] <- 0
+    # Set the follow-up time to x years for patients with follow-up time more than x years.
+    S[S[,1]>limit.year, 1] <- limit.year
+    DLBCL$S <- S
+  
+    # Kaplan-Meier plots
+    km_treatment_stab <- survival::survfit(S~RCHOP21, data=DLBCL, robust=TRUE,
+                                         weights=DLBCL$stabilized.w.i,
+                                         type="kaplan-meier", conf.type="log")
+    km_plot_stab <- survminer::ggsurvplot(km_treatment_stab,
+                                          legend.labs=c("6xRCHOP21", "6xRCHOP21+2R"),
+                                          xlab="Time in years",
+                                          ylab=ylabs[ylabs$outcome==outcome, "label"],
+                                          risk.table=FALSE, conf.int="True",
+                                          robust=TRUE, pval=FALSE)
+    assign(paste0("km_treatment_stab_", outcome), km_treatment_stab)
+    assign(paste0("km_plot_stab_", outcome), km_plot_stab)
+
+    # Kaplan-Meier estimates at x-years
+    treat <- summary(km_treatment_stab, times=limit.year)
+    all <- summary(survival::survfit(S~1, data=DLBCL, robust=TRUE,
+                                     weights=DLBCL$stabilized.w.i,
+                                     type="kaplan-meier", conf.type="log"), times=limit.year)
+    # summary(km_treatment_stab, times=limit.year)
+
+    # Log-rank test using stabilized weights is rejected,
+    # thus the survival between the two treatment groups is significantly different
+    LRT <- RISCA::ipw.log.rank(times=S[, 1], failures=S[, 2],
+                      variable=DLBCL$RCHOP21, weights=DLBCL$stabilized.w.i)
+
+    # Univariate Cox proportional hazards model with stabilized weights
+    cox.wi.stab <- survival::coxph(S~RCHOP21, data=DLBCL,
+                                   weights=DLBCL$stabilized.w.i, robust=TRUE)
+    assign(paste0("cox.wi.stab.", outcome), cox.wi.stab)
+
+    # Restricted Mean Survival Time Analysis
+    if (outcome=="Rec"){
+      RMST <- survival:::survmean(survival::survfit(S.Rec~RCHOP21, data=DLBCL, robust=TRUE,
+                                                         weights=DLBCL$stabilized.w.i,
+                                                         type="kaplan-meier", conf.type="log"), 
+                                       rmean=limit.year)
+    } else if (outcome=="Surv"){
+      RMST <- survival:::survmean(survival::survfit(S.Surv~RCHOP21, data=DLBCL, robust=TRUE,
+                                                         weights=DLBCL$stabilized.w.i,
+                                                         type="kaplan-meier", conf.type="log"), 
+                                       rmean=limit.year)
+    }
+    
+    # Write results to Excel
+    write.xlsx(x=data.frame(names=c("All patients", "6xRCHOP21", "6xRCHOP21+2R", "Difference", "P-value"),
+             KMest=c(round(c(all$surv, treat$surv)*100, 1), "",
+                     round(LRT$p.value, 3)),
+             KMCI=c(paste0("[", round(c(all$lower, treat$lower)*100, 1),
+                           "; ", round(c(all$upper, treat$upper)*100, 1),"]"), "", ""),
+             Coxest=c("",
+                      "(ref)",
+                      round(exp(coef(cox.wi.stab)), 2),
+                      "",
+                      round(summary(cox.wi.stab)$robscore["pvalue"], 3)),
+             CoxCI=c("",
+                     "",
+                     paste0("[", round(exp(confint(cox.wi.stab)[, "2.5 %"]), 2), "; ",
+                            round(exp(confint(cox.wi.stab)[, "97.5 %"]), 2), "]"),
+                     "",
+                     ""),
+             RMSTest=c("",
+                       "",
+                       "",
+                       diff(RMST$matrix[, "rmean"]),
+                       ""),
+             RMSTCI=c("",
+                      "",
+                      "",
+                      paste0("[", round(diff(RMST$matrix[, "rmean"])-1.96*sqrt(RMST$matrix[1, "se(rmean)"]^2+RMST$matrix[2, "se(rmean)"]^2), 2),
+                             "; ", round(diff(RMST$matrix[, "rmean"])+1.96*sqrt(RMST$matrix[1, "se(rmean)"]^2+RMST$matrix[2, "se(rmean)"]^2), 2), "]"),
+                      "")),
+             file=paste0(file.path, "Results/results.", outcome ,".", limit.year, ".xlsx"),
+             sheetName=outcome)
+  }
+  
+  png(file=paste0(file.path, "Results/KM.curves.", limit.year, ".png"),
+      width=600, height=300, res=80)
+  show(ggpubr::ggarrange(km_plot_stab_Rec[[1]], km_plot_stab_Surv[[1]],
+                                     nrow=1, ncol=2, align="h"))
+  grDevices::dev.off()
+
+  png(file=paste0(file.path, "Results/PH.assumption.", limit.year, ".png"),
+      width=600, height=300)
+  par(mfrow=c(1, 2))
+  plot(survival::cox.zph(cox.wi.stab.Rec), main="a. Event-free survival")
+  plot(survival::cox.zph(cox.wi.stab.Surv), main="b. Overall survival")
+  grDevices::dev.off()
+  
+  ### Subgroup analysis
+  # internally develop risk score based on survival probability
+  survival.formula <- S~RCHOP21+geslacht+lft+stadium+ipi_ps_na+ipi_ldh_na+ipi_extra_na+malignancy+region+center+ses.low+ses.high
+  cox.out <- rms::cph(survival.formula, data=DLBCL, weights=DLBCL$stabilized.w.i, x=TRUE, y=TRUE)
+  DLBCL.risk <- DLBCL
+  DLBCL.risk$RCHOP21 <- rep(0, nrow(DLBCL)) # set treatment to zero
+  cox.lp <- predict(object=cox.out, newdata=DLBCL.risk, type="lp")
+  cox.basehaz <- basehaz(cox.out, TRUE)
+  cox.h0 <- cox.basehaz$hazard[cox.basehaz$time==max(cox.basehaz$time[cox.basehaz$time<=limit.year])]
+  fun.event <- function(lp, h0){
+    h <- h0*exp(lp)
+    p <- 1-exp(-h)
+    return(p)
+  }
+  DLBCL$surv.prob <- fun.event(lp=cox.lp, h0=cox.h0)
+  
+  # group patients
+  g <- 4
+  quantiles <- c(min(DLBCL$surv.prob)-0.01, 
+                 as.numeric(quantile(DLBCL$surv.prob, (1:(g-1)/g))), 
+                 max(DLBCL$surv.prob))
+  ordered.DLBCL <- DLBCL[order(DLBCL$surv.prob),]
+  ordered.DLBCL$quantile.nr <- cut(ordered.DLBCL$surv.prob, breaks=quantiles, labels=FALSE)
+
+  # Treatment effect in groups of patients with varying risk
+  for (outcome in c("Rec", "Surv")){
+    # define quantiles
+    g <- 4
+
+    # estimate treatment effect in each quantile
+    KM.est.limit.year <- c()
+    plot.KM <- list()
+    HR.quantiles <- c()
+    HR.lower <- c()
+    HR.upper <- c()
+    RMST.quantiles <- c()
+    RMST.lower <- c()
+    RMST.upper <- c()
+    LRT.stat <- c()
+    LRT.p <- c()
+    for (i in 1:g){
+      # select data for only ith quantile
+      quantile.DLBCL <- DLBCL[DLBCL$ipi_total==i-1,]
+      # quantile.DLBCL <- ordered.DLBCL[ordered.DLBCL$quantile.nr==i,]
+
+      # Survival outcome
+      S <- eval(parse(text=paste0("quantile.DLBCL$S.", outcome)))
+      # Set the censoring of patients with follow-up time more than x years to "censored"
+      S[S[,1]>limit.year, 2] <- 0
+      # Set the follow-up time to x years for patients with follow-up time more than x years.
+      S[S[,1]>limit.year, 1] <- limit.year
+      quantile.DLBCL$S <- S
+      
+      # plot before and after weighting
+      tabUnmatched.q <- tableone::CreateTableOne(vars=vars, strata="RCHOP21", 
+                                               data=quantile.DLBCL, test=FALSE)
+      weighted.data.q <- survey::svydesign(ids = ~ 1, 
+                                         data=quantile.DLBCL[, c("RCHOP21", "stabilized.w.i", vars)], 
+                                         weights = ~ stabilized.w.i)
+      tabWeighted.q <- tableone::svyCreateTableOne(vars = vars, 
+                                                 strata = "RCHOP21", 
+                                                 data = weighted.data.q, 
+                                                 test = FALSE)
+      if (outcome=="Rec"){ # only have to do this once, it's independent of the outcome
+        png(file=paste0(file.path, "Results/Plots/PS.weighting.IPI.", i, ".png"), width=500, height=500)
+        plot(x=tableone::ExtractSmd(tabUnmatched.q), 
+             y=tableone::ExtractSmd(tabWeighted.q), 
+             xlab="Before weighting", ylab="After weighting", 
+             main=paste("IPI score", i),
+             xlim=c(0, 1), ylim=c(0, 1), cex=2, cex.lab=1.5)
+        abline(a=0, b=1, col="red")
+        grDevices::dev.off()
+      }
+
+      # event-free survival at 5 years
+      km <- survival::survfit(S~RCHOP21, data=quantile.DLBCL, robust=TRUE,
+                              weights=quantile.DLBCL[, "stabilized.w.i"],
+                              type="kaplan-meier", conf.type="log")
+      group.treat <- summary(km, times = limit.year)
+      
+      # log-rank test
+      LRT.q <- RISCA::ipw.log.rank(times=S[, 1], failures=S[, 2],
+                        variable=quantile.DLBCL$RCHOP21, 
+                        weights=quantile.DLBCL$stabilized.w.i)
+      LRT.stat <- c(LRT.stat, LRT.q$statistic)
+      LRT.p <- c(LRT.p, LRT.q$p.value)
+
+      # save Kaplan-Meier plots
+      plot.KM[[i]] <- survminer::ggsurvplot(km, conf.int="True")$plot+
+                      ggplot2::theme(legend.position = "none")+
+                      ggplot2::ggtitle(paste0("N=", nrow(quantile.DLBCL)))+
+                      ggplot2::theme(plot.title=element_text(hjust=0.5))
+      if (i == 1){
+        plot.KM[[i]] <- plot.KM[[i]]+
+          ylab(ylabs[ylabs$outcome==outcome, "label"])+
+          xlab("Time in years")
+      }
+      if (i != 1){
+        plot.KM[[i]] <- plot.KM[[i]]+
+                        ggplot2::theme(axis.text.y=element_blank(),
+                         axis.title.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.line.y=element_blank())+
+                        xlab("Time in years")
+      }
+
+      # Kaplan Meier plots for each group of IPI
+      png(file=paste0(file.path, "Results/Plots/", outcome, ".", limit.year, ".Q", i, ".emf"), width=500, height=500)
+      show(survminer::ggsurvplot(km, conf.int="True", risk.table=TRUE))
+      grDevices::dev.off()
+
+      # save event-free survival
+      KM.est.limit.year <- rbind(KM.est.limit.year,
+                                     cbind(group.treat$surv, group.treat$std.err,
+                                           group.treat$lower, group.treat$upper))
+
+      # univariate cox
+      quantile.cox <- survival::coxph(S~RCHOP21, data=quantile.DLBCL,
+                                    weights=quantile.DLBCL[, "stabilized.w.i"],
+                                    robust=TRUE)
+
+      # save hazard ratios
+      HR.quantiles <- c(HR.quantiles, as.numeric(exp(coef(quantile.cox)[1])))
+      HR.lower <- c(HR.lower, as.numeric(exp(confint(quantile.cox)[1,1])))
+      HR.upper <- c(HR.upper, as.numeric(exp(confint(quantile.cox)[1,2])))
+
+      # RMST
+      if (outcome=="Rec"){
+        quantile.RMST <- survival:::survmean(survival::survfit(S.Rec~RCHOP21, data=quantile.DLBCL, robust=TRUE,
+                                                         weights=quantile.DLBCL$stabilized.w.i,
+                                                         type="kaplan-meier", conf.type="log"), 
+                                       rmean=limit.year)
+      } else if (outcome=="Surv"){
+        quantile.RMST <- survival:::survmean(survival::survfit(S.Surv~RCHOP21, data=quantile.DLBCL, robust=TRUE,
+                                                         weights=quantile.DLBCL$stabilized.w.i,
+                                                         type="kaplan-meier", conf.type="log"), 
+                                       rmean=limit.year)
+      }
+      RMST.quantiles <- c(RMST.quantiles, diff(quantile.RMST$matrix[, "rmean"]))
+      RMST.lower <- c(RMST.lower, diff(quantile.RMST$matrix[, "rmean"])-1.96*sqrt(quantile.RMST$matrix[1, "se(rmean)"]^2+quantile.RMST$matrix[2, "se(rmean)"]^2))
+      RMST.upper <- c(RMST.upper, diff(quantile.RMST$matrix[, "rmean"])+1.96*sqrt(quantile.RMST$matrix[1, "se(rmean)"]^2+quantile.RMST$matrix[2, "se(rmean)"]^2))
+    }
+
+    # combine Kaplan-Meier estimates into one data frame
+    KM.est.limit.year <- cbind(KM.est.limit.year, rep(c(0, 1), g))
+    KM.est.limit.year <- cbind(KM.est.limit.year, rep(1:g, each=2))
+    colnames(KM.est.limit.year) <- c("event", "sd", "lower", "upper", "treatment", "risk.group")
+    KM.est.limit.year <- as.data.frame(KM.est.limit.year)
+    
+    assign(paste0("LRT.p.", outcome), LRT.p)
+    assign(paste0("LRT.stat.", outcome), LRT.stat)
+
+    # combine hazard ratio"s into one data frame
+    HR.df <- data.frame(HR=HR.quantiles, lower=HR.lower, upper=HR.upper, risk.group=1:g)
+
+    # combine RMST into one data frame
+    RMST.df <- data.frame(RMST=RMST.quantiles, lower=RMST.lower, upper=RMST.upper, risk.group=1:g)
+
+    # Calculate the absolute difference in event-free survival, i.e. benefit and harm.
+    diff <- c()
+    j <- 1
+    for (i in seq(from=1, to=nrow(KM.est.limit.year), by=2)){
+      diff <- rbind(diff, KM.est.limit.year[i+1,]- KM.est.limit.year[i,])
+
+      # standard deviation of difference is square root of sum of variances
+      diff[j, "sd"] <- sqrt(KM.est.limit.year[i+1, "sd"]^2+KM.est.limit.year[i, "sd"]^2)
+      diff[j, "lower"] <- diff[j, "event"]-1.96*diff[j, "sd"]
+      diff[j, "upper"] <- diff[j, "event"]+1.96*diff[j, "sd"]
+      j <- j + 1
+    }
+    diff <- as.data.frame(diff)
+    diff$risk.group <- 1:g
+
+    # create plot for event-free survival
+    # Kaplan-Meier plots
+    km.plots <- ggpubr::ggarrange(plot.KM[[1]], plot.KM[[2]],
+                                  plot.KM[[3]], plot.KM[[4]],
+                                  ncol=4, nrow=1)
+    assign(paste0("km.plots.", outcome), km.plots)
+    
+    # plot for absolute reduction in event-free survival
+    km_treatment_stab <- eval(parse(text=paste0("km_treatment_stab_", outcome)))
+    avg.diff <- diff(summary(km_treatment_stab, times = limit.year)$surv)
+    diff.plot <- ggplot2::ggplot(data=diff, 
+                                 ggplot2::aes(x=factor(risk.group), y=event))+
+      ggplot2::geom_hline(yintercept=0)+
+      ggplot2::geom_hline(yintercept=avg.diff, linetype="dashed", linewidth=1.2)+
+      ggplot2::geom_errorbar(ggplot2::aes(ymin=lower, ymax=upper), 
+                             position=ggplot2::position_dodge(0.9), width=0)+
+      ggplot2::geom_point(size=5, shape=18, color="red")+
+      ggplot2::scale_y_continuous(limits=c(-0.2, 0.3), 
+                                  breaks=seq(-0.2, 0.3, by=0.1),
+                                  labels=scales::percent_format(accuracy=1))+
+      ggplot2::theme(text=ggplot2::element_text(size=15), 
+                     axis.title.x=ggplot2::element_blank(),
+                     axis.text.x=ggplot2::element_blank(),
+                     axis.ticks.x=ggplot2::element_blank(),
+                     legend.position="none",
+                     panel.grid.major = ggplot2::element_blank(), 
+                     panel.grid.minor = ggplot2::element_blank())+
+      ggplot2::ylab("Absolute 5-year risk reduction") # \n Harm <         > Benefit
+    assign(paste0("diff.plot.", outcome), diff.plot)
+
+    # create plot for hazard ratios
+    cox.wi.stab <- eval(parse(text=paste0("cox.wi.stab.", outcome)))
+    hazard.plot <- ggplot2::ggplot(data=HR.df, ggplot2::aes(x=risk.group, y=HR))+
+      ggplot2::geom_hline(yintercept=1)+
+      ggplot2::geom_hline(yintercept=exp(coef(cox.wi.stab)), linetype="dashed", linewidth=1.2)+
+      ggplot2::geom_errorbar(ggplot2::aes(ymin=lower, ymax=upper),
+                             position=ggplot2::position_dodge(0.9), width=0)+
+      ggplot2::geom_point(size=5, shape=18, color="red")+
+      ggplot2::scale_x_discrete(limits=as.factor(1:g))+
+      ggplot2::scale_y_continuous(limits=c(0.4, 2), 
+                                  breaks=seq(0.4, 2, by=0.2),
+                                  labels=scales::number_format(accuracy=0.01))+
+      ggplot2::theme(text=ggplot2::element_text(size=15),
+                      axis.title.x=ggplot2::element_blank(),
+                      axis.text.x=ggplot2::element_blank(),
+                      axis.ticks.x=ggplot2::element_blank(),
+                      panel.grid.major = ggplot2::element_blank(),
+                      panel.grid.minor = ggplot2::element_blank())+
+      ggplot2::ylab("Hazard ratio")
+    assign(paste0("hazard.plot.", outcome), hazard.plot)
+
+    # create plot for RMST
+    RMST.plot <- ggplot2::ggplot(data=RMST.df, ggplot2::aes(x=risk.group, y=RMST))+
+      ggplot2::geom_hline(yintercept=0)+
+      ggplot2::geom_hline(yintercept=diff(RMST$matrix[, "rmean"]), linetype="dashed", linewidth=1.2)+
+      ggplot2::geom_errorbar(ggplot2::aes(ymin=lower, ymax=upper),
+                             position=ggplot2::position_dodge(0.9), width=0)+
+      ggplot2::geom_point(size=5, shape=18, color="red")+
+      ggplot2::scale_x_discrete(limits=c("1"="Low", "2"="Low-Int", "3"="High-Int", "4"="High"))+
+      # ggplot2::scale_y_continuous(limits=c(-0.4, 1.4), 
+      #                             breaks=seq(-0.4, 1.4, by=0.2),
+      #                             labels=scales::number_format(accuracy=0.01))+
+      ggplot2::theme(text=ggplot2::element_text(size=15),
+                      panel.grid.major = ggplot2::element_blank(),
+                      panel.grid.minor = ggplot2::element_blank())+
+      ggplot2::xlab("IPI score")+
+      ggplot2::ylab("RMST")
+    assign(paste0("RMST.plot.", outcome), RMST.plot)
+  }
+
+  # combine plots
+  png(file=paste0(file.path, "Results/Rec.grouped.TE.", limit.year, ".png"), 
+      width=600, height=800)
+  show(ggpubr::ggarrange(km.plots.Rec, diff.plot.Rec, hazard.plot.Rec, RMST.plot.Rec,
+                                     nrow=4, ncol=1, align="h"))
+  grDevices::dev.off()
+  png(file=paste0(file.path, "Results/Surv.grouped.TE.", limit.year, ".png"), 
+      width=600, height=800)
+  show(ggpubr::ggarrange(km.plots.Surv, diff.plot.Surv, hazard.plot.Surv, RMST.plot.Surv,
+                                     nrow=4, ncol=1, align="h"))
+  grDevices::dev.off()
+  
+  # write LRT to Excel
+  write.xlsx(data.frame(cbind(LRT.stat.Rec, LRT.p.Rec, 
+                              LRT.stat.Surv, LRT.p.Surv)),
+           file=paste0(file.path, "Results/LRT.xlsx"))
+}
+
+png(file=paste0(file.path, "Results/Before.After.weighting.PS.png"), 
+    width=16, height=16, units="cm", res=300)
+par(mar=rep(0, 4))
+layout(matrix(1:4, ncol=2, byrow=TRUE))
+for (i in 1:4){
+  plot(NA, xlim=0:1, ylim=0:1, xaxt="n", yaxt="n", bty="n")
+  img <- png::readPNG(paste0(file.path, "Results/Plots/PS.weighting.IPI.", i, ".png"))
+  rasterImage(img, 0, 0, 1, 1)
+}
+grDevices::dev.off()
+```
+```{r, include=TRUE}
+knitr::include_graphics(paste0(file.path, "Results/KM.curves.5.png"))
+knitr::include_graphics(paste0(file.path, "Results/PH.assumption.5.png"))
+knitr::include_graphics(paste0(file.path, "Results/Rec.grouped.TE.5.png"))
+knitr::include_graphics(paste0(file.path, "Results/Surv.grouped.TE.5.png"))
+knitr::include_graphics(paste0(file.path, "Results/Before.After.weighting.PS.png"))
+```
+# Instrumental Variable Analysis
+```{r, eval=TRUE}
+# instrument: Z = region (TODO: what about center?)
+# exposure: X = RCHOP21
+# outcome: Y or T = S.Rec
+# confounders for instrument and outcome: L = geslacht, etc
+
+# E[X | L, Z]
+fitX.LZ <- glm(formula = RCHOP21 ~ region + 
+                 center + geslacht + lft + stadium + ipi_ps_na + ipi_ldh_na + 
+                 ipi_extra_na + malignancy + ses.low + ses.high, data=DLBCL)
+# Event-free survival: E[lambda(t | L, X)]
+fitT.LX <- coxph(formula = Surv(time=Rec.time, event=efsi) ~ RCHOP21 + 
+                   center + geslacht + lft + stadium + ipi_ps_na + ipi_ldh_na + 
+                 ipi_extra_na + malignancy + ses.low + ses.high, data=DLBCL)
+fitIV.Rec <- ivtools::ivcoxph(estmethod="ts", fitX.LZ=fitX.LZ, fitT.LX=fitT.LX, 
+                          data=DLBCL, crtl=TRUE)
+print(summary(fitIV.Rec))
+# additional rituximab decreases the hazard of an event
+print(exp(summary(fitIV.Rec)$coefficients[1,1]))
+
+# Overall survival: E[lambda(t | L, X)]
+fitT.LX <- coxph(formula = Surv(time=Surv.time, event=dood) ~ RCHOP21 + 
+                   center + geslacht + lft + stadium + ipi_ps_na + ipi_ldh_na + 
+                   ipi_extra_na + malignancy + ses.low + ses.high, data=DLBCL)
+fitIV.Surv <- ivtools::ivcoxph(estmethod="ts", fitX.LZ=fitX.LZ, fitT.LX=fitT.LX, 
+                          data=DLBCL, crtl=TRUE)
+print(summary(fitIV.Surv))
+# additional rituximab decreases the hazard of dying
+print(exp(summary(fitIV.Surv)$coefficients[1,1]))
+```

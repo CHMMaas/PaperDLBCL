@@ -453,11 +453,13 @@ DLBCL.raw$region &lt;- as.factor(DLBCL.raw$region)</code></pre>
 <pre class="r"><code>to.be.imputed.DLBCL &lt;- DLBCL.raw[, c(&quot;RCHOP21&quot;, &quot;geslacht&quot;, &quot;lft&quot;, &quot;stadium&quot;,
     &quot;ipi_ldh&quot;, &quot;ipi_extra&quot;, &quot;ipi_total&quot;, &quot;ipi_ps&quot;, &quot;region&quot;, 
     &quot;sescat&quot;, &quot;malignancy&quot;, &quot;center&quot;, &quot;efsi&quot;, &quot;EFS.time&quot;, &quot;dood&quot;, &quot;OS.time&quot;,
-    &quot;jaar&quot;)]</code></pre>
+    &quot;jaar&quot;, &quot;respons&quot;)]</code></pre>
 </div>
 <div id="impute-missing-data-with-single-imputation" class="section level3">
 <h3>Impute missing data with single imputation</h3>
-<pre class="r"><code>DLBCL &lt;- mice::complete(mice::mice(to.be.imputed.DLBCL, m=1, print=FALSE))</code></pre>
+<pre class="r"><code># exclude respons from data frame before starting imputation
+to.be.imputed.DLBCL &lt;- to.be.imputed.DLBCL %&gt;% select(-respons)
+DLBCL &lt;- mice::complete(mice::mice(to.be.imputed.DLBCL, m=1, print=FALSE))</code></pre>
 <p>Save the distributions of all variables, which is necessary for
 Harrell summaries.</p>
 <pre class="r"><code>dd &lt;- rms::datadist(DLBCL)
